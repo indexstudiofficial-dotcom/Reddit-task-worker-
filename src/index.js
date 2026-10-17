@@ -1,40 +1,20 @@
 // ============================================================
-// REPORTLI AI — REDDIT TASK WORKER
-// Version: 1.0.0
+// Reportli AI — Reddit Task Worker
+// Version: 2.0.0
 //
-// Responsibilities:
-// 1. Receive a Supabase Cron POST request.
-// 2. Check every application.
-// 3. Inspect the latest Reddit task in planner_runs.
-// 4. Skip applications whose latest Reddit task is pending.
-// 5. Create a new task when no Reddit task exists or the
-//    latest Reddit task has status Completed.
-// 6. Select the highest-buying-intention pending niche.
-// 7. Use the applications.company data with Sarvam AI.
-// 8. Generate exactly 5 subreddits and 5 search queries.
-// 9. Save the task to planner_runs with pending_count = 5.
-// 10. Mark the selected niche's reddit_status as Completed.
+// Features:
+// 1. Triggered by Supabase Cron using POST /cron.
+// 2. Reads applications and customer_niches.
+// 3. Selects the highest buying-intention pending niche.
+// 4. If all niches are Completed, rotates using oldest updated_at.
+// 5. Uses Sarvam AI to generate 5 subreddits and 5 queries.
+// 6. Saves failures to planner_runs.error.
+// 7. Allows failed tasks to be retried on a later Cron run.
 // ============================================================
 
-
-// ============================================================
-// CONSTANTS
-// ============================================================
-
-const WORKER_NAME = "reportli-reddit-task-worker";
-const WORKER_VERSION = "1.0.0";
-
-const SARVAM_API_URL =
-  "https://api.sarvam.ai/v1/chat/completions";
-
-const SARVAM_MODEL = "sarvam-105b";
-
-const REDDIT_WORKER_TYPE = "reddit_research";
-const REDDIT_SOURCE = "reddit";
-
-const REQUIRED_QUERY_COUNT = 5;
-const REQUIRED_SUBREDDIT_COUNT = 5;
-
+const WORKER_TYPE = "reddit_research";
+const SOURCE = "reddit";
+const TASK_COUNT = 5;
 
 // ============================================================
 // MAIN REQUEST HANDLER
@@ -44,709 +24,50 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Health check
     if (request.method === "GET" && url.pathname === "/health") {
       return jsonResponse({
-        success: true,
-        worker: WORKER_NAME,
-        version: WORKER_VERSION,
-        status: "healthy",
-        timestamp: new Date().toISOString()
+        ok: true,
+        worker: "reddit-task-worker",
+        version: "2.0.0",
       });
     }
 
-    // Accept Supabase Cron POST requests at / or /cron.
     if (
-      request.method === "POST" &&
-      (url.pathname === "/" || url.pathname === "/cron")
+      request.method !== "POST" ||
+      (url.pathname !== "/" && url.pathname !== "/cron")
     ) {
-      try {
-        validateEnvironment(env);
-
-        const result = await runCron(env);
-
-        return jsonResponse({
-          success: true,
-          worker: WORKER_NAME,
-          ...result
-        });
-      } catch (error) {
-        console.error("Reddit task worker failed:", error.message);
-
-        return jsonResponse(
-          {
-            success: false,
-            worker: WORKER_NAME,
-            error: error.message,
-            timestamp: new Date().toISOString()
-          },
-          500
-        );
-      }
+      return jsonResponse(
+        { error: "Use POST /cron to trigger the worker." },
+        405
+      );
     }
 
-    return jsonResponse(
-      {
-        success: false,
-        error: "Route not found"
-      },
-      404
-    );
-  }
-};
-
-
-// ============================================================
-// CRON PROCESSOR
-// ============================================================
-
-async function runCron(env) {
-  const applications = await getApplications(env);
-
-  const results = {
-    applications_checked: applications.length,
-    tasks_created: 0,
-    applications_skipped: 0,
-    no_pending_niche: 0,
-    errors: []
-  };
-
-  for (const application of applications) {
     try {
-      const result = await processApplication(application, env);
+      validateEnvironment(env);
 
-      if (result.created) {
-        results.tasks_created++;
-      } else {
-        results.applications_skipped++;
+      const results = await runCron(env);
 
-        if (result.reason === "no_pending_niche") {
-          results.no_pending_niche++;
-        }
-      }
-
-      console.log(
-        JSON.stringify({
-          application_id: application.id,
-          ...result
-        })
-      );
+      return jsonResponse({
+        ok: true,
+        ...results,
+      });
     } catch (error) {
-      results.errors.push({
-        application_id: application.id,
-        error: error.message
+      console.error("Reddit Task Worker failed:", {
+        code: error.code || "WORKER_ERROR",
+        message: error.message,
       });
 
-      console.error(
-        `Application ${application.id} failed:`,
-        error.message
-      );
-    }
-  }
-
-  // Do not report the entire cron run as successful if one or
-  // more applications failed.
-  if (results.errors.length > 0) {
-    throw new Error(
-      JSON.stringify({
-        message: "One or more applications failed",
-        results
-      })
-    );
-  }
-
-  return results;
-}
-
-
-// ============================================================
-// PROCESS ONE APPLICATION
-// ============================================================
-
-async function processApplication(application, env) {
-  const applicationId = application.id;
-
-  // ----------------------------------------------------------
-  // STEP 1: CHECK THE LATEST REDDIT TASK
-  // ----------------------------------------------------------
-
-  const latestTask = await getLatestRedditTask(
-    applicationId,
-    env
-  );
-
-  if (latestTask) {
-    const status = String(latestTask.status || "")
-      .trim()
-      .toLowerCase();
-
-    // A pending task already exists.
-    // Do not create another one.
-    if (status === "pending") {
-      return {
-        created: false,
-        reason: "latest_task_pending",
-        latest_task_id: latestTask.id
-      };
-    }
-
-    // Only a completed task allows the next task to be created.
-    if (status !== "completed") {
-      return {
-        created: false,
-        reason: "latest_task_not_completed",
-        latest_task_id: latestTask.id,
-        latest_task_status: latestTask.status
-      };
-    }
-  }
-
-  // ----------------------------------------------------------
-  // STEP 2: SELECT THE HIGHEST-PRIORITY PENDING NICHE
-  // ----------------------------------------------------------
-
-  const niche = await getHighestPriorityPendingNiche(
-    applicationId,
-    env
-  );
-
-  if (!niche) {
-    return {
-      created: false,
-      reason: "no_pending_niche"
-    };
-  }
-
-  // ----------------------------------------------------------
-  // STEP 3: GENERATE SEARCH QUERIES AND SUBREDDITS
-  // ----------------------------------------------------------
-
-  const research = await generateRedditResearch(
-    application.company,
-    niche.niche_name,
-    env
-  );
-
-  // ----------------------------------------------------------
-  // STEP 4: BUILD THE REQUIRED TASK TEXT
-  // ----------------------------------------------------------
-
-  const objective =
-    `Find 5 relevant Reddit posts from ${niche.niche_name} ` +
-    "discussing business problems, challenges, and solutions " +
-    "they are looking for.";
-
-  const taskText = [
-    `Customer Niche: ${niche.niche_name}`,
-    "",
-    `Objective: ${objective}`,
-    "",
-    "Recommended Subreddits:",
-    ...research.subreddits.map(name => `- r/${name}`),
-    "",
-    "Search Queries:",
-    ...research.queries.map(query => `- ${query}`)
-  ].join("\n");
-
-  // ----------------------------------------------------------
-  // STEP 5: MARK THE NICHE COMPLETED
-  //
-  // Update only after successful AI generation.
-  // If task insertion fails, restore the niche to pending.
-  // ----------------------------------------------------------
-
-  await updateNicheStatus(
-    niche.id,
-    "Completed",
-    env
-  );
-
-  let createdTask;
-
-  try {
-    // --------------------------------------------------------
-    // STEP 6: CREATE THE REDDIT TASK
-    // --------------------------------------------------------
-
-    createdTask = await createRedditTask(
-      application,
-      niche,
-      taskText,
-      env
-    );
-  } catch (error) {
-    // Restore the niche so a later cron can retry it.
-    try {
-      await updateNicheStatus(
-        niche.id,
-        "pending",
-        env
-      );
-    } catch (rollbackError) {
-      console.error(
-        "Failed to restore niche status:",
-        rollbackError.message
-      );
-    }
-
-    throw error;
-  }
-
-  return {
-    created: true,
-    reason: "reddit_task_created",
-    task_id: createdTask.id,
-    application_id: applicationId,
-    niche_id: niche.id,
-    niche_name: niche.niche_name,
-    pending_count: createdTask.pending_count,
-    subreddit_count: research.subreddits.length,
-    query_count: research.queries.length
-  };
-}
-
-
-// ============================================================
-// GET APPLICATIONS
-// ============================================================
-
-async function getApplications(env) {
-  return await supabaseRequest(
-    "/rest/v1/applications" +
-      "?select=id,user_id,company,created_at" +
-      "&order=created_at.asc" +
-      "&limit=1000",
-    env
-  );
-}
-
-
-// ============================================================
-// GET THE LATEST REDDIT TASK FOR AN APPLICATION
-// ============================================================
-
-async function getLatestRedditTask(applicationId, env) {
-  const query = new URLSearchParams({
-    select: "id,application_id,status,created_at,niche",
-    application_id: `eq.${applicationId}`,
-    source: `eq.${REDDIT_SOURCE}`,
-    order: "created_at.desc,id.desc",
-    limit: "1"
-  });
-
-  const rows = await supabaseRequest(
-    `/rest/v1/planner_runs?${query.toString()}`,
-    env
-  );
-
-  return rows.length > 0 ? rows[0] : null;
-}
-
-
-// ============================================================
-// SELECT HIGHEST BUYING-INTENTION PENDING NICHE
-// ============================================================
-
-async function getHighestPriorityPendingNiche(
-  applicationId,
-  env
-) {
-  const query = new URLSearchParams({
-    select:
-      "id,application_id,niche_name,buying_intention," +
-      "reddit_status,user_id,created_at",
-    application_id: `eq.${applicationId}`,
-    reddit_status: "eq.pending",
-    order: "created_at.asc",
-    limit: "1000"
-  });
-
-  const niches = await supabaseRequest(
-    `/rest/v1/customer_niches?${query.toString()}`,
-    env
-  );
-
-  if (!niches.length) {
-    return null;
-  }
-
-  // Highest buying_intention first.
-  // If tied, use the earliest-created niche.
-  niches.sort((a, b) => {
-    const scoreA =
-      a.buying_intention == null
-        ? -Infinity
-        : Number(a.buying_intention);
-
-    const scoreB =
-      b.buying_intention == null
-        ? -Infinity
-        : Number(b.buying_intention);
-
-    if (scoreA !== scoreB) {
-      return scoreB - scoreA;
-    }
-
-    return (
-      new Date(a.created_at).getTime() -
-      new Date(b.created_at).getTime()
-    );
-  });
-
-  return niches[0];
-}
-
-
-// ============================================================
-// GENERATE 5 SUBREDDITS AND 5 SEARCH QUERIES WITH SARVAM AI
-// ============================================================
-
-async function generateRedditResearch(
-  companyData,
-  nicheName,
-  env
-) {
-  const companyText =
-    companyData == null
-      ? "No company information was provided."
-      : typeof companyData === "string"
-        ? companyData
-        : JSON.stringify(companyData);
-
-  const prompt = `
-You are generating search instructions for a Reddit research worker.
-
-CUSTOMER NICHE:
-${nicheName}
-
-COMPANY DATA:
-${companyText}
-
-Your task is to generate exactly:
-1. Five relevant subreddit names.
-2. Five relevant Reddit search queries.
-
-Requirements for subreddits:
-- Suggest communities relevant to the customer niche and company.
-- Return subreddit names without the "r/" prefix.
-- Do not include URLs.
-- Avoid duplicate names.
-- Do not invent subreddit names intentionally.
-- Prefer established, topic-relevant communities.
-
-Requirements for search queries:
-- Return exactly five distinct search queries.
-- Focus on business problems, challenges, solution requests,
-  and tools relevant to the customer niche.
-- Use practical search phrases that can be sent to Reddit search.
-- Do not include explanations.
-
-Return ONLY valid JSON in this format:
-
-{
-  "subreddits": [
-    "example1",
-    "example2",
-    "example3",
-    "example4",
-    "example5"
-  ],
-  "queries": [
-    "search query 1",
-    "search query 2",
-    "search query 3",
-    "search query 4",
-    "search query 5"
-  ]
-}
-`;
-
-  const response = await fetch(SARVAM_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "api-subscription-key": env.SARVAM_API_KEY
-    },
-    body: JSON.stringify({
-      model: SARVAM_MODEL,
-      messages: [
+      return jsonResponse(
         {
-          role: "system",
-          content:
-            "Return only valid JSON. Do not add markdown or explanations."
+          ok: false,
+          error: error.code || "WORKER_ERROR",
+          message: error.message,
         },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      temperature: 0.2,
-      max_tokens: 1500
-    })
-  });
-
-  const responseText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `Sarvam API failed (${response.status}): ` +
-      responseText.slice(0, 1000)
-    );
-  }
-
-  let apiResult;
-
-  try {
-    apiResult = JSON.parse(responseText);
-  } catch {
-    throw new Error("Sarvam returned an invalid API response.");
-  }
-
-  const content =
-    apiResult?.choices?.[0]?.message?.content;
-
-  if (typeof content !== "string" || !content.trim()) {
-    throw new Error(
-      "Sarvam returned an empty research response."
-    );
-  }
-
-  const parsed = parseSarvamJson(content);
-
-  const subreddits = normalizeSubreddits(
-    parsed.subreddits
-  );
-
-  const queries = normalizeQueries(
-    parsed.queries
-  );
-
-  if (subreddits.length !== REQUIRED_SUBREDDIT_COUNT) {
-    throw new Error(
-      `Expected exactly 5 unique subreddits; received ${subreddits.length}.`
-    );
-  }
-
-  if (queries.length !== REQUIRED_QUERY_COUNT) {
-    throw new Error(
-      `Expected exactly 5 unique queries; received ${queries.length}.`
-    );
-  }
-
-  return {
-    subreddits,
-    queries
-  };
-}
-
-
-// ============================================================
-// PARSE SARVAM JSON
-// ============================================================
-
-function parseSarvamJson(content) {
-  let cleaned = content.trim();
-
-  // Handle a response wrapped in a Markdown code fence.
-  cleaned = cleaned
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "")
-    .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    throw new Error(
-      "Sarvam did not return valid JSON for Reddit research."
-    );
-  }
-}
-
-
-// ============================================================
-// NORMALIZE SUBREDDIT NAMES
-// ============================================================
-
-function normalizeSubreddits(value) {
-  if (!Array.isArray(value)) {
-    throw new Error(
-      "Sarvam response is missing the subreddits array."
-    );
-  }
-
-  const names = value
-    .filter(item => typeof item === "string")
-    .map(item =>
-      item
-        .trim()
-        .replace(/^r\//i, "")
-        .replace(/^\/+|\/+$/g, "")
-    )
-    .filter(name => /^[A-Za-z0-9_]+$/.test(name));
-
-  return [...new Set(names)].slice(
-    0,
-    REQUIRED_SUBREDDIT_COUNT
-  );
-}
-
-
-// ============================================================
-// NORMALIZE SEARCH QUERIES
-// ============================================================
-
-function normalizeQueries(value) {
-  if (!Array.isArray(value)) {
-    throw new Error(
-      "Sarvam response is missing the queries array."
-    );
-  }
-
-  const queries = value
-    .filter(item => typeof item === "string")
-    .map(item => item.trim())
-    .filter(item => item.length > 0);
-
-  return [...new Set(queries)].slice(
-    0,
-    REQUIRED_QUERY_COUNT
-  );
-}
-
-
-// ============================================================
-// UPDATE CUSTOMER NICHE STATUS AND TIMESTAMP
-// ============================================================
-
-async function updateNicheStatus(nicheId, status, env) {
-  const query = new URLSearchParams({
-    id: `eq.${nicheId}`
-  });
-
-  await supabaseRequest(
-    `/rest/v1/customer_niches?${query.toString()}`,
-    env,
-    {
-      method: "PATCH",
-      body: {
-        reddit_status: status,
-        updated_at: new Date().toISOString()
-      },
-      prefer: "return=representation",
-      requireRows: true
-    }
-  );
-}
-
-
-// ============================================================
-// CREATE THE REDDIT TASK IN planner_runs
-// ============================================================
-
-async function createRedditTask(
-  application,
-  niche,
-  taskText,
-  env
-) {
-  const now = new Date().toISOString();
-
-  const task = {
-    application_id: application.id,
-    user_id: niche.user_id ?? application.user_id ?? null,
-    worker_type: REDDIT_WORKER_TYPE,
-    source: REDDIT_SOURCE,
-    task: taskText,
-    pending_count: 5,
-    error: null,
-    niche: niche.niche_name,
-    created_at: now,
-    started_at: null,
-    status: "pending"
-  };
-
-  const rows = await supabaseRequest(
-    "/rest/v1/planner_runs",
-    env,
-    {
-      method: "POST",
-      body: task,
-      prefer: "return=representation",
-      requireRows: true
-    }
-  );
-
-  return rows[0];
-}
-
-
-// ============================================================
-// SUPABASE REST HELPER
-// ============================================================
-
-async function supabaseRequest(
-  path,
-  env,
-  options = {}
-) {
-  const url =
-    env.SUPABASE_URL.replace(/\/+$/, "") + path;
-
-  const headers = {
-    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization":
-      `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-  };
-
-  if (options.prefer) {
-    headers["Prefer"] = options.prefer;
-  }
-
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers,
-    body:
-      options.body === undefined
-        ? undefined
-        : JSON.stringify(options.body)
-  });
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `Supabase ${options.method || "GET"} ${path} failed ` +
-      `(${response.status}): ${text.slice(0, 1500)}`
-    );
-  }
-
-  let data = [];
-
-  if (text.trim()) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(
-        `Supabase returned invalid JSON for ${path}.`
+        500
       );
     }
-  }
-
-  if (!Array.isArray(data)) {
-    data = data ? [data] : [];
-  }
-
-  if (options.requireRows && data.length === 0) {
-    throw new Error(
-      `Supabase returned no rows for ${options.method || "GET"} ${path}.`
-    );
-  }
-
-  return data;
-}
-
+  },
+};
 
 // ============================================================
 // ENVIRONMENT VALIDATION
@@ -756,34 +77,782 @@ function validateEnvironment(env) {
   const required = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "SARVAM_API_KEY"
+    "SARVAM_API_KEY",
   ];
 
-  const missing = required.filter(
-    key => !env[key]
-  );
-
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing Cloudflare secrets: ${missing.join(", ")}`
-    );
+  for (const name of required) {
+    if (!env[name]) {
+      throw createError(
+        "CONFIG_MISSING",
+        `Missing Cloudflare secret: ${name}`
+      );
+    }
   }
 }
 
+// ============================================================
+// SUPABASE REST API HELPER
+// ============================================================
+
+async function supabaseRequest(env, path, options = {}) {
+  const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
+
+  const response = await fetch(`${baseUrl}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+  const bodyText = await response.text();
+
+  if (!response.ok) {
+    console.error("Supabase request failed:", {
+      status: response.status,
+      path,
+      body: bodyText.slice(0, 2000),
+    });
+
+    throw createError(
+      `SUPABASE_HTTP_${response.status}`,
+      `Supabase request failed with HTTP ${response.status}`
+    );
+  }
+
+  if (!bodyText) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(bodyText);
+  } catch {
+    return bodyText;
+  }
+}
 
 // ============================================================
-// JSON RESPONSE
+// GET APPLICATIONS
+// ============================================================
+
+async function getApplications(env) {
+  return await supabaseRequest(
+    env,
+    "applications?select=id,user_id,company&order=created_at.asc&limit=1000"
+  );
+}
+
+// ============================================================
+// GET LATEST REDDIT TASK FOR AN APPLICATION
+// ============================================================
+
+async function getLatestRedditTask(env, applicationId) {
+  const query = new URLSearchParams({
+    select: "id,status",
+    application_id: `eq.${applicationId}`,
+    source: `eq.${SOURCE}`,
+    order: "created_at.desc,id.desc",
+    limit: "1",
+  });
+
+  const rows = await supabaseRequest(
+    env,
+    `planner_runs?${query.toString()}`
+  );
+
+  return rows?.[0] || null;
+}
+
+// ============================================================
+// GET CUSTOMER NICHES
+// ============================================================
+
+async function getCustomerNiches(env, applicationId) {
+  const query = new URLSearchParams({
+    select:
+      "id,application_id,user_id,niche_name,buying_intention,reddit_status,created_at,updated_at",
+    application_id: `eq.${applicationId}`,
+    order: "created_at.asc",
+    limit: "1000",
+  });
+
+  return await supabaseRequest(
+    env,
+    `customer_niches?${query.toString()}`
+  );
+}
+
+// ============================================================
+// NICHE SELECTION
+//
+// Normal operation:
+//   Choose the pending niche with the highest buying_intention.
+//
+// Rotation:
+//   If every niche is Completed, choose the oldest updated_at.
+//   After successful task creation, set the other niches pending.
+// ============================================================
+
+function selectNiche(niches) {
+  if (!Array.isArray(niches) || niches.length === 0) {
+    return {
+      niche: null,
+      rotation: false,
+    };
+  }
+
+  const pendingNiches = niches.filter(
+    (niche) =>
+      String(niche.reddit_status || "").toLowerCase() === "pending"
+  );
+
+  // Normal queue: highest buying intention first.
+  if (pendingNiches.length > 0) {
+    pendingNiches.sort((a, b) => {
+      const scoreDifference =
+        Number(b.buying_intention || 0) -
+        Number(a.buying_intention || 0);
+
+      if (scoreDifference !== 0) {
+        return scoreDifference;
+      }
+
+      return (
+        new Date(a.created_at || 0).getTime() -
+        new Date(b.created_at || 0).getTime()
+      );
+    });
+
+    return {
+      niche: pendingNiches[0],
+      rotation: false,
+    };
+  }
+
+  // Rotate only when ALL niches are Completed.
+  const allCompleted = niches.every(
+    (niche) =>
+      String(niche.reddit_status || "").toLowerCase() === "completed"
+  );
+
+  if (!allCompleted) {
+    return {
+      niche: null,
+      rotation: false,
+    };
+  }
+
+  // Oldest updated_at first.
+  const completedNiches = [...niches].sort((a, b) => {
+    const aTime = a.updated_at
+      ? new Date(a.updated_at).getTime()
+      : 0;
+
+    const bTime = b.updated_at
+      ? new Date(b.updated_at).getTime()
+      : 0;
+
+    if (aTime !== bTime) {
+      return aTime - bTime;
+    }
+
+    return (
+      new Date(a.created_at || 0).getTime() -
+      new Date(b.created_at || 0).getTime()
+    );
+  });
+
+  return {
+    niche: completedNiches[0],
+    rotation: true,
+  };
+}
+
+// ============================================================
+// SARVAM AI — GENERATE SUBREDDITS AND SEARCH QUERIES
+// ============================================================
+
+async function generateResearchPlan(env, company, nicheName) {
+  const prompt = `
+You are a Reddit market research planner.
+
+COMPANY CONTEXT:
+${String(company || "No company description provided").slice(0, 12000)}
+
+CUSTOMER NICHE:
+${nicheName}
+
+Generate a practical Reddit research plan for this customer niche.
+
+Return ONLY a valid JSON object with this exact structure:
+
+{
+  "subreddits": [
+    "subreddit_name_1",
+    "subreddit_name_2",
+    "subreddit_name_3",
+    "subreddit_name_4",
+    "subreddit_name_5"
+  ],
+  "queries": [
+    "search query 1",
+    "search query 2",
+    "search query 3",
+    "search query 4",
+    "search query 5"
+  ]
+}
+
+Rules:
+- Return exactly 5 unique subreddit names.
+- Return exactly 5 unique search queries.
+- Subreddit names must not contain the r/ prefix.
+- Do not include URLs.
+- Do not include explanations outside the JSON.
+- Choose relevant subreddits for the niche and company context.
+- Queries should find Reddit discussions about business problems,
+  challenges, frustrations, and solutions people are seeking.
+- Do not invent subreddit names if you can avoid it.
+`;
+
+  let response;
+
+  try {
+    response = await fetch(
+      "https://api.sarvam.ai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api-subscription-key": env.SARVAM_API_KEY,
+        },
+        body: JSON.stringify({
+          model: "sarvam-105b",
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+          temperature: 0.2,
+          max_tokens: 1500,
+          response_format: {
+            type: "json_object",
+          },
+        }),
+      }
+    );
+  } catch (error) {
+    throw createError(
+      "SARVAM_NETWORK_ERROR",
+      `Could not connect to Sarvam: ${error.message}`
+    );
+  }
+
+  // Read the response body exactly once.
+  const responseText = await response.text();
+
+  console.log("Sarvam HTTP status:", response.status);
+
+  if (!response.ok) {
+    console.error("Sarvam error response:", responseText.slice(0, 2000));
+
+    throw createError(
+      `SARVAM_HTTP_${response.status}`,
+      `Sarvam returned HTTP ${response.status}`
+    );
+  }
+
+  if (!responseText.trim()) {
+    throw createError(
+      "SARVAM_EMPTY_RESPONSE",
+      "Sarvam returned an empty HTTP response body."
+    );
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error(
+      "Sarvam returned invalid JSON:",
+      responseText.slice(0, 2000)
+    );
+
+    throw createError(
+      "SARVAM_INVALID_JSON",
+      "Sarvam returned a response that was not valid JSON."
+    );
+  }
+
+  let content = data?.choices?.[0]?.message?.content;
+
+  if (Array.isArray(content)) {
+    content = content
+      .map((part) => part?.text || "")
+      .join("");
+  }
+
+  if (content && typeof content === "object") {
+    content = JSON.stringify(content);
+  }
+
+  if (typeof content !== "string" || !content.trim()) {
+    console.error(
+      "Sarvam response had no usable message content:",
+      JSON.stringify(data).slice(0, 2000)
+    );
+
+    throw createError(
+      "SARVAM_EMPTY_CONTENT",
+      "Sarvam returned an empty research response."
+    );
+  }
+
+  let plan;
+
+  try {
+    const cleaned = content
+      .trim()
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/, "");
+
+    plan = JSON.parse(cleaned);
+  } catch {
+    console.error("Sarvam content was not valid plan JSON:", content);
+
+    throw createError(
+      "SARVAM_INVALID_PLAN_JSON",
+      "Sarvam's message did not contain valid plan JSON."
+    );
+  }
+
+  const subreddits = normalizeUniqueStrings(plan.subreddits);
+  const queries = normalizeUniqueStrings(plan.queries);
+
+  if (subreddits.length !== 5 || queries.length !== 5) {
+    throw createError(
+      "SARVAM_INVALID_PLAN_COUNT",
+      `Expected 5 unique subreddits and 5 queries; received ${subreddits.length} subreddits and ${queries.length} queries.`
+    );
+  }
+
+  return {
+    subreddits,
+    queries,
+  };
+}
+
+// ============================================================
+// NORMALIZE AND VALIDATE SARVAM ARRAYS
+// ============================================================
+
+function normalizeUniqueStrings(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+
+    let cleaned = value.trim();
+
+    if (!cleaned) {
+      continue;
+    }
+
+    cleaned = cleaned
+      .replace(/^[-*]\s*/, "")
+      .replace(/^r\//i, "")
+      .replace(/^["']|["']$/g, "")
+      .trim();
+
+    const key = cleaned.toLowerCase();
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    unique.push(cleaned);
+  }
+
+  return unique;
+}
+
+// ============================================================
+// FORMAT THE TASK AS PLAIN TEXT
+// ============================================================
+
+function formatTask(nicheName, plan) {
+  return [
+    `Customer Niche: ${nicheName}`,
+    "",
+    `Objective: Find 5 relevant Reddit posts from ${nicheName} discussing business problems, challenges, and solutions they are looking for.`,
+    "",
+    "Recommended Subreddits:",
+    ...plan.subreddits.map((name) => `- r/${name}`),
+    "",
+    "Search Queries:",
+    ...plan.queries.map((query) => `- ${query}`),
+  ].join("\n");
+}
+
+// ============================================================
+// CREATE A PLANNER TASK ROW
+// ============================================================
+
+async function insertPlannerTask(env, taskRow) {
+  return await supabaseRequest(
+    env,
+    "planner_runs",
+    {
+      method: "POST",
+      headers: {
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(taskRow),
+    }
+  );
+}
+
+// ============================================================
+// SAVE A FAILURE TO planner_runs.error
+//
+// A failed task is recorded even if Sarvam fails before generating
+// the actual task text.
+// ============================================================
+
+async function saveFailedTask(
+  env,
+  application,
+  niche,
+  error
+) {
+  const errorCode = error.code || "REDDIT_TASK_ERROR";
+
+  const row = {
+    application_id: application.id,
+    user_id: application.user_id || niche?.user_id || null,
+    worker_type: WORKER_TYPE,
+    source: SOURCE,
+    task: niche
+      ? `Reddit research task generation failed for customer niche: ${niche.niche_name}`
+      : "Reddit research task generation failed because no customer niche was selected.",
+    pending_count: TASK_COUNT,
+    error: errorCode,
+    niche: niche?.niche_name || null,
+    created_at: new Date().toISOString(),
+    started_at: null,
+    status: "failed",
+  };
+
+  try {
+    await insertPlannerTask(env, row);
+
+    console.log(
+      JSON.stringify({
+        application_id: application.id,
+        created: false,
+        status: "failed",
+        error: errorCode,
+        niche: niche?.niche_name || null,
+      })
+    );
+  } catch (saveError) {
+    console.error("Could not save failure to planner_runs:", {
+      application_id: application.id,
+      original_error: errorCode,
+      save_error: saveError.code || saveError.message,
+    });
+  }
+}
+
+// ============================================================
+// UPDATE A NICHE STATUS
+// ============================================================
+
+async function updateNiche(env, nicheId, status, updatedAt) {
+  const query = new URLSearchParams({
+    id: `eq.${nicheId}`,
+  });
+
+  return await supabaseRequest(
+    env,
+    `customer_niches?${query.toString()}`,
+    {
+      method: "PATCH",
+      headers: {
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        reddit_status: status,
+        updated_at: updatedAt,
+      }),
+    }
+  );
+}
+
+// ============================================================
+// PROCESS ONE APPLICATION
+// ============================================================
+
+async function processApplication(env, application) {
+  let selectedNiche = null;
+
+  try {
+    // --------------------------------------------------------
+    // 1. Check the most recent Reddit task.
+    // --------------------------------------------------------
+
+    const latestTask = await getLatestRedditTask(
+      env,
+      application.id
+    );
+
+    const latestStatus = String(
+      latestTask?.status || ""
+    ).toLowerCase();
+
+    if (latestStatus === "pending") {
+      return {
+        application_id: application.id,
+        created: false,
+        reason: "reddit_task_already_pending",
+      };
+    }
+
+    // Completed tasks allow a new task.
+    // Failed tasks also allow a retry.
+    //
+    // Other statuses are skipped to avoid duplicate work.
+    if (
+      latestTask &&
+      latestStatus !== "completed" &&
+      latestStatus !== "failed"
+    ) {
+      return {
+        application_id: application.id,
+        created: false,
+        reason: "latest_task_status_not_eligible",
+        status: latestTask.status,
+      };
+    }
+
+    // --------------------------------------------------------
+    // 2. Load niches and select one.
+    // --------------------------------------------------------
+
+    const niches = await getCustomerNiches(
+      env,
+      application.id
+    );
+
+    const selection = selectNiche(niches);
+
+    selectedNiche = selection.niche;
+
+    if (!selectedNiche) {
+      return {
+        application_id: application.id,
+        created: false,
+        reason: "no_pending_niche",
+      };
+    }
+
+    // --------------------------------------------------------
+    // 3. Ask Sarvam to generate the research plan.
+    //
+    // If this fails, save the error code in planner_runs.error.
+    // --------------------------------------------------------
+
+    const plan = await generateResearchPlan(
+      env,
+      application.company,
+      selectedNiche.niche_name
+    );
+
+    const taskText = formatTask(
+      selectedNiche.niche_name,
+      plan
+    );
+
+    // --------------------------------------------------------
+    // 4. Insert the task first.
+    //
+    // Do not reset other niches until task generation succeeds.
+    // --------------------------------------------------------
+
+    const now = new Date().toISOString();
+
+    const taskRow = {
+      application_id: application.id,
+      user_id:
+        application.user_id || selectedNiche.user_id || null,
+      worker_type: WORKER_TYPE,
+      source: SOURCE,
+      task: taskText,
+      pending_count: TASK_COUNT,
+      error: null,
+      niche: selectedNiche.niche_name,
+      created_at: now,
+      started_at: null,
+      status: "pending",
+    };
+
+    await insertPlannerTask(env, taskRow);
+
+    // --------------------------------------------------------
+    // 5. Mark the selected niche Completed.
+    //
+    // updated_at now records when this niche was processed.
+    // --------------------------------------------------------
+
+    await updateNiche(
+      env,
+      selectedNiche.id,
+      "Completed",
+      now
+    );
+
+    // --------------------------------------------------------
+    // 6. If all niches were previously Completed, rotate.
+    //
+    // The oldest updated_at niche is processed first.
+    // After its task is created, the other niches are reset
+    // to pending so they can be researched again.
+    // --------------------------------------------------------
+
+    if (selection.rotation) {
+      const otherNiches = niches.filter(
+        (niche) => niche.id !== selectedNiche.id
+      );
+
+      for (const niche of otherNiches) {
+        await updateNiche(
+          env,
+          niche.id,
+          "pending",
+          now
+        );
+      }
+
+      console.log(
+        JSON.stringify({
+          application_id: application.id,
+          rotation: true,
+          processed_niche: selectedNiche.niche_name,
+          reset_niches_to_pending: otherNiches.length,
+        })
+      );
+    }
+
+    return {
+      application_id: application.id,
+      created: true,
+      niche: selectedNiche.niche_name,
+      rotation: selection.rotation,
+    };
+  } catch (error) {
+    console.error("Application processing failed:", {
+      application_id: application.id,
+      niche: selectedNiche?.niche_name || null,
+      code: error.code || "REDDIT_TASK_ERROR",
+      message: error.message,
+    });
+
+    await saveFailedTask(
+      env,
+      application,
+      selectedNiche,
+      error
+    );
+
+    return {
+      application_id: application.id,
+      created: false,
+      status: "failed",
+      error: error.code || "REDDIT_TASK_ERROR",
+    };
+  }
+}
+
+// ============================================================
+// RUN THE CRON JOB
+// ============================================================
+
+async function runCron(env) {
+  const applications = await getApplications(env);
+
+  if (!Array.isArray(applications)) {
+    throw createError(
+      "APPLICATIONS_INVALID_RESPONSE",
+      "Supabase did not return an applications array."
+    );
+  }
+
+  const results = {
+    applications_checked: applications.length,
+    tasks_created: 0,
+    applications_skipped: 0,
+    failed: 0,
+    details: [],
+  };
+
+  // Sequential processing helps avoid sending many requests
+  // to Sarvam simultaneously.
+  for (const application of applications) {
+    const result = await processApplication(
+      env,
+      application
+    );
+
+    results.details.push(result);
+
+    if (result.created) {
+      results.tasks_created++;
+    } else if (result.status === "failed") {
+      results.failed++;
+    } else {
+      results.applications_skipped++;
+    }
+
+    console.log(JSON.stringify(result));
+  }
+
+  // Return results even if an individual application failed.
+  // This prevents one Sarvam failure from hiding the other
+  // applications' results from the Cron response.
+  return results;
+}
+
+// ============================================================
+// ERROR HELPER
+// ============================================================
+
+function createError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+// ============================================================
+// JSON RESPONSE HELPER
 // ============================================================
 
 function jsonResponse(data, status = 200) {
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store"
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
       }
-    }
-  );
-    }
