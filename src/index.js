@@ -1,22 +1,23 @@
 // ============================================================
 // REPORTLI AI — REDDIT TASK WORKER
-// Version: 2.1.0
+// Version: 2.2.0
 //
-// Features:
-// 1. Triggered by Supabase Cron through POST /cron.
-// 2. Selects pending niches by highest buying_intention.
-// 3. Generates exactly 5 subreddits and 5 search queries.
-// 4. Saves tasks in planner_runs.
-// 5. Marks the selected niche Completed and verifies the update.
-// 6. If all niches are Completed, processes the oldest updated_at
-//    niche and resets the other niches to pending.
-// 7. Saves error codes to planner_runs.error.
-// 8. Logs Supabase update failures.
+// Changes in 2.2.0 (fix for intermittent SARVAM_EMPTY_CONTENT):
+// - sarvam-105b is a reasoning model. With max_tokens 1500 the
+//   "thinking" could use the whole budget, leaving message.content
+//   empty/null (finish_reason: "length"). Fixed by:
+//     * raising max_tokens to 6000
+//     * reasoning_effort: "low"
+//     * removing response_format (can yield empty content)
+//     * stripping <think> blocks and extracting the JSON object
+//     * retrying up to 3 times on empty/invalid/wrong-count output
+//     * logging finish_reason when content is empty
 // ============================================================
 
 const WORKER_TYPE = "reddit_research";
 const SOURCE = "reddit";
 const TASK_COUNT = 5;
+const SARVAM_MAX_ATTEMPTS = 3;
 
 // ============================================================
 // REQUEST HANDLER
@@ -30,7 +31,7 @@ export default {
       return jsonResponse({
         ok: true,
         worker: "reddit-task-worker",
-        version: "2.1.0",
+        version: "2.2.0",
       });
     }
 
@@ -223,12 +224,6 @@ async function getCustomerNiches(env, applicationId) {
 
 // ============================================================
 // SELECT A NICHE
-//
-// Normal:
-// Highest buying_intention among pending niches.
-//
-// Rotation:
-// If EVERY niche is Completed, choose the oldest updated_at.
 // ============================================================
 
 function selectNiche(niches) {
@@ -288,8 +283,134 @@ function selectNiche(niches) {
 }
 
 // ============================================================
+// SARVAM AI — ONE CALL
+//
+// Returns { status, content, reasoning, finishReason }.
+// Throws only for network / HTTP / non-JSON-envelope problems.
+// Empty content is returned (not thrown) so the caller can retry.
+// ============================================================
+
+async function callSarvam(env, prompt, useOptionalParams) {
+  const body = {
+    model: "sarvam-105b",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    // Reasoning models spend tokens on "thinking" BEFORE the answer.
+    // 1500 was too small, so content was sometimes empty.
+    max_tokens: 6000,
+  };
+
+  if (useOptionalParams) {
+    body.reasoning_effort = "low";
+  }
+
+  let response;
+
+  try {
+    response = await fetch("https://api.sarvam.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-subscription-key": env.SARVAM_API_KEY,
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw createError(
+      "SARVAM_NETWORK_ERROR",
+      `Could not connect to Sarvam: ${error.message}`
+    );
+  }
+
+  const responseText = await response.text();
+
+  console.log("Sarvam HTTP status:", response.status);
+
+  if (!response.ok) {
+    console.error("Sarvam error body:", responseText.slice(0, 2000));
+
+    const err = createError(
+      `SARVAM_HTTP_${response.status}`,
+      `Sarvam returned HTTP ${response.status}.`
+    );
+    err.status = response.status;
+    throw err;
+  }
+
+  if (!responseText.trim()) {
+    return { content: "", reasoning: "", finishReason: "empty_body" };
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error("Sarvam invalid JSON:", responseText.slice(0, 2000));
+    throw createError(
+      "SARVAM_INVALID_JSON",
+      "Sarvam returned invalid JSON."
+    );
+  }
+
+  const choice = data?.choices?.[0];
+  let content = choice?.message?.content;
+
+  if (Array.isArray(content)) {
+    content = content.map((part) => part?.text || "").join("");
+  }
+
+  if (content && typeof content === "object") {
+    content = JSON.stringify(content);
+  }
+
+  return {
+    content: typeof content === "string" ? content : "",
+    reasoning:
+      typeof choice?.message?.reasoning_content === "string"
+        ? choice.message.reasoning_content
+        : "",
+    finishReason: choice?.finish_reason || "unknown",
+  };
+}
+
+// ============================================================
+// EXTRACT A JSON OBJECT FROM MODEL TEXT
+//
+// Handles <think> blocks, ```json fences and extra prose.
+// ============================================================
+
+function extractJsonObject(text) {
+  if (typeof text !== "string") return null;
+
+  const cleaned = text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/```(?:json)?/gi, "")
+    .trim();
+
+  if (!cleaned) return null;
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // fall through to brace extraction
+  }
+
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+
+  if (start === -1 || end <= start) return null;
+
+  try {
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================
 // SARVAM AI
-// Generate 5 subreddit names and 5 search queries.
+// Generate 5 subreddit names and 5 search queries (with retries).
 // ============================================================
 
 async function generateResearchPlan(env, company, nicheName) {
@@ -330,124 +451,84 @@ Rules:
 - Search for business problems, challenges, frustrations,
   and solutions people are seeking.
 - Avoid inventing subreddit names.
+- Output only the JSON object, with no text before or after it.
 `;
 
-  let response;
+  let useOptionalParams = true;
+  let lastError = null;
 
-  try {
-    response = await fetch(
-      "https://api.sarvam.ai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "api-subscription-key": env.SARVAM_API_KEY,
-        },
-        body: JSON.stringify({
-          model: "sarvam-105b",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.2,
-          max_tokens: 1500,
-          response_format: { type: "json_object" },
-        }),
+  for (let attempt = 1; attempt <= SARVAM_MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = await callSarvam(env, prompt, useOptionalParams);
+
+      // Prefer the real answer. Only if it is empty, try to salvage
+      // a JSON object from the reasoning text.
+      let plan = extractJsonObject(result.content);
+
+      if (!plan && !result.content.trim() && result.reasoning) {
+        plan = extractJsonObject(result.reasoning);
       }
-    );
-  } catch (error) {
-    throw createError(
-      "SARVAM_NETWORK_ERROR",
-      `Could not connect to Sarvam: ${error.message}`
-    );
+
+      if (!result.content.trim() && !plan) {
+        console.error("Sarvam returned empty content:", {
+          attempt,
+          finish_reason: result.finishReason,
+          reasoning_chars: result.reasoning.length,
+        });
+
+        lastError = createError(
+          "SARVAM_EMPTY_CONTENT",
+          `Sarvam returned an empty response (finish_reason: ${result.finishReason}).`
+        );
+        continue;
+      }
+
+      if (!plan) {
+        lastError = createError(
+          "SARVAM_INVALID_PLAN_JSON",
+          "Sarvam's response did not contain valid plan JSON."
+        );
+        continue;
+      }
+
+      const subreddits = normalizeUniqueStrings(plan.subreddits);
+      const queries = normalizeUniqueStrings(plan.queries);
+
+      if (subreddits.length !== 5 || queries.length !== 5) {
+        lastError = createError(
+          "SARVAM_INVALID_PLAN_COUNT",
+          `Expected 5 subreddits and 5 queries; received ${subreddits.length} subreddits and ${queries.length} queries.`
+        );
+        continue;
+      }
+
+      return { subreddits, queries };
+    } catch (error) {
+      lastError = error;
+
+      // If Sarvam rejects the optional parameter, retry without it.
+      if (error.status === 400 && useOptionalParams) {
+        useOptionalParams = false;
+        continue;
+      }
+
+      // Retry only transient errors.
+      const transient =
+        error.code === "SARVAM_NETWORK_ERROR" ||
+        error.code === "SARVAM_HTTP_429" ||
+        (error.status && error.status >= 500);
+
+      if (!transient) throw error;
+    }
+
+    console.warn(`Sarvam attempt ${attempt} failed; retrying.`);
+    await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
   }
 
-  // Read the response body only once.
-  const responseText = await response.text();
-
-  console.log("Sarvam HTTP status:", response.status);
-
-  if (!response.ok) {
-    console.error(
-      "Sarvam error body:",
-      responseText.slice(0, 2000)
-    );
-
-    throw createError(
-      `SARVAM_HTTP_${response.status}`,
-      `Sarvam returned HTTP ${response.status}.`
-    );
-  }
-
-  if (!responseText.trim()) {
-    throw createError(
-      "SARVAM_EMPTY_RESPONSE",
-      "Sarvam returned an empty HTTP response body."
-    );
-  }
-
-  let data;
-
-  try {
-    data = JSON.parse(responseText);
-  } catch {
-    console.error(
-      "Sarvam invalid JSON:",
-      responseText.slice(0, 2000)
-    );
-
-    throw createError(
-      "SARVAM_INVALID_JSON",
-      "Sarvam returned invalid JSON."
-    );
-  }
-
-  let content = data?.choices?.[0]?.message?.content;
-
-  if (Array.isArray(content)) {
-    content = content.map((part) => part?.text || "").join("");
-  }
-
-  if (content && typeof content === "object") {
-    content = JSON.stringify(content);
-  }
-
-  if (typeof content !== "string" || !content.trim()) {
-    console.error(
-      "Sarvam returned no usable content:",
-      JSON.stringify(data).slice(0, 2000)
-    );
-
-    throw createError(
-      "SARVAM_EMPTY_CONTENT",
-      "Sarvam returned an empty research response."
-    );
-  }
-
-  let plan;
-
-  try {
-    const cleaned = content
-      .trim()
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/, "");
-
-    plan = JSON.parse(cleaned);
-  } catch {
-    throw createError(
-      "SARVAM_INVALID_PLAN_JSON",
-      "Sarvam's response did not contain valid plan JSON."
-    );
-  }
-
-  const subreddits = normalizeUniqueStrings(plan.subreddits);
-  const queries = normalizeUniqueStrings(plan.queries);
-
-  if (subreddits.length !== 5 || queries.length !== 5) {
-    throw createError(
-      "SARVAM_INVALID_PLAN_COUNT",
-      `Expected 5 subreddits and 5 queries; received ${subreddits.length} subreddits and ${queries.length} queries.`
-    );
-  }
-
-  return { subreddits, queries };
+  throw (
+    lastError ||
+    createError("SARVAM_EMPTY_CONTENT", "Sarvam failed after retries.")
+  );
 }
 
 // ============================================================
@@ -516,14 +597,7 @@ async function insertPlannerTask(env, row) {
 }
 
 // ============================================================
-// FIXED NICHE STATUS UPDATE
-//
-// IMPORTANT:
-// - Uses the actual niche UUID.
-// - Requests the updated row from Supabase.
-// - Verifies that a row was updated.
-// - Verifies the saved status.
-// - Throws an explicit error if the update did not happen.
+// NICHE STATUS UPDATE (verified)
 // ============================================================
 
 async function updateNiche(env, nicheId, status, updatedAt) {
@@ -631,14 +705,10 @@ async function processApplication(env, application) {
   let selectedNiche = null;
 
   try {
-    // 1. Check the latest Reddit task.
     const latestTask = await getLatestRedditTask(env, application.id);
 
-    const latestStatus = String(
-      latestTask?.status || ""
-    ).toLowerCase();
+    const latestStatus = String(latestTask?.status || "").toLowerCase();
 
-    // Don't create another task while one is pending.
     if (latestStatus === "pending") {
       return {
         application_id: application.id,
@@ -647,7 +717,6 @@ async function processApplication(env, application) {
       };
     }
 
-    // Permit a new task after Completed or failed.
     if (
       latestTask &&
       latestStatus !== "completed" &&
@@ -661,7 +730,6 @@ async function processApplication(env, application) {
       };
     }
 
-    // 2. Fetch niches and select the next niche.
     const niches = await getCustomerNiches(env, application.id);
     const selection = selectNiche(niches);
 
@@ -675,7 +743,6 @@ async function processApplication(env, application) {
       };
     }
 
-    // 3. Generate the plan with Sarvam.
     const plan = await generateResearchPlan(
       env,
       application.company,
@@ -685,7 +752,6 @@ async function processApplication(env, application) {
     const taskText = formatTask(selectedNiche.niche_name, plan);
     const now = new Date().toISOString();
 
-    // 4. Insert the task.
     const createdRows = await insertPlannerTask(env, {
       application_id: application.id,
       user_id: application.user_id || selectedNiche.user_id || null,
@@ -707,30 +773,15 @@ async function processApplication(env, application) {
       );
     }
 
-    // 5. Mark the selected niche Completed and VERIFY it.
-    // If this fails, an explicit error is logged and saved.
-    await updateNiche(
-      env,
-      selectedNiche.id,
-      "Completed",
-      now
-    );
+    await updateNiche(env, selectedNiche.id, "Completed", now);
 
-    // 6. If rotating, reset the other niches to pending.
-    // This runs only after the selected niche was successfully
-    // marked Completed.
     if (selection.rotation) {
       const otherNiches = niches.filter(
         (niche) => niche.id !== selectedNiche.id
       );
 
       for (const niche of otherNiches) {
-        await updateNiche(
-          env,
-          niche.id,
-          "pending",
-          now
-        );
+        await updateNiche(env, niche.id, "pending", now);
       }
 
       console.log(
@@ -787,8 +838,6 @@ async function runCron(env) {
     details: [],
   };
 
-  // Process sequentially to avoid unnecessary concurrent
-  // Sarvam requests.
   for (const application of applications) {
     const outcome = await processApplication(env, application);
 
@@ -805,8 +854,6 @@ async function runCron(env) {
     console.log(JSON.stringify(outcome));
   }
 
-  // Return HTTP 200 for the completed Cron run even when one
-  // application failed. Individual failures are in details.
   return result;
 }
 
@@ -821,4 +868,4 @@ function jsonResponse(data, status = 200) {
       "Content-Type": "application/json; charset=utf-8",
     },
   });
-         }
+}
