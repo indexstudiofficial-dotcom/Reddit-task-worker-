@@ -601,6 +601,33 @@ async function insertPlannerTask(env, row) {
 // ============================================================
 
 async function updateNiche(env, nicheId, status, updatedAt) {
+  try {
+    return await patchNiche(env, nicheId, status, updatedAt);
+  } catch (error) {
+    // If the DB rejects the value (e.g. a CHECK constraint that only
+    // allows lowercase), retry once with the lowercase variant.
+    const rejected =
+      /23514|check constraint|invalid input value|violates/i.test(
+        String(error.message)
+      );
+
+    if (rejected && status !== status.toLowerCase()) {
+      console.warn(
+        `Status "${status}" rejected; retrying with "${status.toLowerCase()}".`
+      );
+      return await patchNiche(
+        env,
+        nicheId,
+        status.toLowerCase(),
+        updatedAt
+      );
+    }
+
+    throw error;
+  }
+}
+
+async function patchNiche(env, nicheId, status, updatedAt) {
   const query = new URLSearchParams({
     id: `eq.${nicheId}`,
     select: "id,application_id,niche_name,reddit_status,updated_at",
@@ -660,8 +687,9 @@ async function updateNiche(env, nicheId, status, updatedAt) {
 
 async function saveFailedTask(env, application, niche, error) {
   const errorCode = error.code || "REDDIT_TASK_ERROR";
+  const errorText = `${errorCode}: ${error.message || ""}`.slice(0, 500);
 
-  const row = {
+  const base = {
     application_id: application.id,
     user_id: application.user_id || niche?.user_id || null,
     worker_type: WORKER_TYPE,
@@ -669,31 +697,46 @@ async function saveFailedTask(env, application, niche, error) {
     task: niche
       ? `Reddit research task generation failed for customer niche: ${niche.niche_name}`
       : "Reddit research task failed because no niche was selected.",
-    pending_count: TASK_COUNT,
-    error: errorCode,
+    error: errorText,
     niche: niche?.niche_name || null,
-    created_at: new Date().toISOString(),
-    started_at: null,
     status: "failed",
   };
 
-  try {
-    await insertPlannerTask(env, row);
+  // Try the full row first, then a minimal row in case an optional
+  // column is what the database is rejecting.
+  const attempts = [
+    {
+      ...base,
+      pending_count: TASK_COUNT,
+      created_at: new Date().toISOString(),
+      started_at: null,
+    },
+    base,
+  ];
 
-    console.log(
-      JSON.stringify({
-        event: "failed_task_saved",
+  for (const row of attempts) {
+    try {
+      await insertPlannerTask(env, row);
+
+      console.log(
+        JSON.stringify({
+          event: "failed_task_saved",
+          application_id: application.id,
+          niche: niche?.niche_name || null,
+          error: errorCode,
+        })
+      );
+      return;
+    } catch (saveError) {
+      // The full Supabase response body is already logged by
+      // supabaseRequest ("Supabase HTTP error:").
+      console.error("Could not save failed task:", {
         application_id: application.id,
-        niche: niche?.niche_name || null,
-        error: errorCode,
-      })
-    );
-  } catch (saveError) {
-    console.error("Could not save failed task:", {
-      application_id: application.id,
-      original_error: errorCode,
-      save_error: saveError.code || saveError.message,
-    });
+        original_error: errorCode,
+        save_error: saveError.code,
+        save_message: saveError.message,
+      });
+    }
   }
 }
 
